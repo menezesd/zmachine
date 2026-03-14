@@ -19,6 +19,9 @@
         (z3 (bitwise-and word #x1F)))
     (list z1 z2 z3 end?)))
 
+;; Abbreviation recursion guard
+(define *in-abbreviation* #f)
+
 ;; Decode a Z-encoded string starting at byte address addr
 ;; Returns (cons decoded-string bytes-consumed)
 (define (decode-zstring addr)
@@ -60,11 +63,17 @@
 
        ;; Abbreviation pending
        (abbrev-pending
-        (let* ((entry (+ (* 32 abbrev-pending) z))
-               (abbrev-addr (* 2 (mem-word (+ *abbrev-table-addr* (* 2 entry)))))
-               (decoded (car (decode-zstring abbrev-addr))))
-          (for-each (lambda (c) (emit-char c)) (string->list decoded)))
-        (set! abbrev-pending #f))
+        (if *in-abbreviation*
+            ;; Spec: abbreviation strings must not themselves use abbreviations
+            (set! abbrev-pending #f)
+            (let* ((entry (+ (* 32 abbrev-pending) z))
+                   (abbrev-addr (* 2 (mem-word (+ *abbrev-table-addr* (* 2 entry)))))
+                   (saved *in-abbreviation*))
+              (set! *in-abbreviation* #t)
+              (let ((decoded (car (decode-zstring abbrev-addr))))
+                (for-each (lambda (c) (emit-char c)) (string->list decoded)))
+              (set! *in-abbreviation* saved)
+              (set! abbrev-pending #f))))
 
        ;; Z-char 0: space
        ((= z 0)
@@ -96,19 +105,15 @@
             (emit-char (string-ref *a1* index))
             (set! alphabet 0))
            ((= alphabet 2)
-            (if (= z 6)
-                ;; ZSCII escape: next two Z-chars form a 10-bit value
-                (set! tenbit-stage 'high)
-                ;; Z-char 7 in A2 = newline
-                (if (= z 7)
-                    (emit-char #\newline)
-                    (emit-char (string-ref *a2* index))))
-            (set! alphabet 0)))
-          ;; Reset alphabet after printing (V3+ single shift)
-          (when (and (>= *version* 3) (= alphabet 1))
-            'ok)  ; already reset above for A1 and A2
-          (when (and (>= *version* 3) (= alphabet 0))
-            'ok)))))
+            (cond
+             ((= z 6)
+              ;; ZSCII escape: next two Z-chars form a 10-bit value
+              (set! tenbit-stage 'high))
+             ((= z 7)
+              (emit-char #\newline))
+             (else
+              (emit-char (string-ref *a2* index))))
+            (set! alphabet 0)))))))
 
     ;; Process each Z-character
     (for-each translate-zchar zchars)

@@ -896,11 +896,13 @@
   ;; VAR:4 sread / aread
   (vector-set! *op-var* 4
     (lambda (ops)
-      (z-read (car ops) (cadr ops))
-      ;; V5+ returns terminating character; V1-4 does not store
-      (when (>= *version* 5)
-        (let ((result-var (read-store-target!)))
-          (set-variable! result-var 13)))))
+      (let ((text-buf (car ops))
+            (parse-buf (if (>= (length ops) 2) (cadr ops) 0)))
+        (z-read text-buf parse-buf)
+        ;; V5+ returns terminating character; V1-4 does not store
+        (when (>= *version* 5)
+          (let ((result-var (read-store-target!)))
+            (set-variable! result-var 13))))))
 
   ;; VAR:5 print_char output-character-code
   (vector-set! *op-var* 5
@@ -1131,19 +1133,18 @@
       (z-call (car ops) (list (cadr ops)) #f)))
 
   ;; 2OP:27 set_colour foreground background [V5+]
+  ;; Z-machine: 2=black 3=red 4=green 5=yellow 6=blue 7=magenta 8=cyan 9=white
+  ;; ANSI fg:   30=black 31=red 32=green 33=yellow 34=blue 35=magenta 36=cyan 37=white
   (vector-set! *op-2op* 27
     (lambda (ops)
-      ;; Map Z-machine colors to ANSI
       (let ((fg (car ops))
             (bg (cadr ops)))
+        (when (= fg 1) (display "\033[39m"))   ; default fg
+        (when (= bg 1) (display "\033[49m"))   ; default bg
         (when (and (>= fg 2) (<= fg 9))
-          (let ((ansi-fg (vector-ref '#(30 31 32 33 34 35 36 37) (- fg 2))))
-            (display (string-append "\033[" (number->string ansi-fg) "m"))))
+          (display (string-append "\033[" (number->string (+ 28 fg)) "m")))
         (when (and (>= bg 2) (<= bg 9))
-          (let ((ansi-bg (vector-ref '#(40 41 42 43 44 45 46 47) (- bg 2))))
-            (display (string-append "\033[" (number->string ansi-bg) "m"))))
-        (when (or (= fg 1) (= bg 1))
-          (display "\033[39;49m"))  ; default colors
+          (display (string-append "\033[" (number->string (+ 38 bg)) "m")))
         (flush-output-port (current-output-port)))))
 
   ;; 2OP:28 throw value stack-frame [V5+]
@@ -1215,9 +1216,9 @@
              (places (s16 (cadr ops)))
              (result (if (>= places 0)
                          (arithmetic-shift number places)
-                         ;; Logical right shift: no sign extension
-                         (arithmetic-shift number places))))
-        (set-variable! result-var (u16 (bitwise-and result #xFFFF))))))
+                         ;; Logical right shift: mask to 16-bit first to prevent sign extension
+                         (arithmetic-shift (bitwise-and number #xFFFF) places))))
+        (set-variable! result-var (u16 result)))))
 
   ;; EXT:3 art_shift number places -> (result) [V5+]
   (vector-set! *op-ext* 3
