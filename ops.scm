@@ -835,8 +835,10 @@
   ;; 0OP:7 restart
   (vector-set! *op-0op* 7
     (lambda (ops)
-      ;; TODO: reload story file
-      (error "restart not implemented")))
+      (do-restart!)
+      ;; Clear screen and resume from initial PC
+      (display "\033[2J\033[1;1H")
+      (flush-output-port (current-output-port))))
 
   ;; 0OP:8 ret_popped
   (vector-set! *op-0op* 8
@@ -1270,16 +1272,21 @@
   ;; EXT:9 save_undo -> (result) [V5+]
   (vector-set! *op-ext* 9
     (lambda (ops)
-      (let ((result-var (read-store-target!)))
-        ;; -1 = interpreter doesn't support undo
-        (set-variable! result-var (u16-from-signed -1)))))
+      (let ((save-pc *pc*))       ; PC at store target byte
+        (let ((result-var (read-store-target!)))
+          (if (do-save-undo save-pc)
+              (set-variable! result-var 1)    ; 1 = undo saved
+              (set-variable! result-var 0)))))) ; 0 = failed
 
   ;; EXT:10 restore_undo -> (result) [V5+]
   (vector-set! *op-ext* 10
     (lambda (ops)
       (let ((result-var (read-store-target!)))
-        ;; 0 = failed
-        (set-variable! result-var 0))))
+        (if (do-restore-undo)
+            ;; State restored. PC points to save_undo's store target.
+            (let ((save-result-var (read-store-target!)))
+              (set-variable! save-result-var 2))  ; 2 = restored from undo
+            (set-variable! result-var 0)))))       ; 0 = failed
 
   ;; EXT:11 print_unicode char-number [V5+]
   (vector-set! *op-ext* 11
