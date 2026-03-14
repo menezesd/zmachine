@@ -39,17 +39,49 @@
 (define *current-window* 0)       ; 0 = lower, 1 = upper
 (define *upper-window-height* 0)  ; height of upper window in lines
 
+;; Output stream 3: capture to memory table
+;; Stack of table addresses (stream 3 can nest up to 16 levels)
+(define *stream3-stack* '())
+
+(define (stream3-active?)
+  (not (null? *stream3-stack*)))
+
+(define (stream3-write-char! ch)
+  ;; Append a ZSCII character to the current stream 3 table.
+  ;; Table format: word 0 = character count, then characters as bytes.
+  (let* ((table-addr (car *stream3-stack*))
+         (count (mem-word table-addr))
+         (char-code (if (char? ch) (char->integer ch) ch)))
+    (mem-set-byte! (+ table-addr 2 count) char-code)
+    (mem-set-word! table-addr (+ count 1))))
+
+(define (stream3-write-string! str)
+  (let ((len (string-length str)))
+    (let loop ((i 0))
+      (when (< i len)
+        (stream3-write-char! (string-ref str i))
+        (loop (+ i 1))))))
+
 (define (z-print str)
-  (display str)
-  (flush-output-port (current-output-port)))
+  (if (stream3-active?)
+      (stream3-write-string! str)
+      (begin
+        (display str)
+        (flush-output-port (current-output-port)))))
 
 (define (z-print-char ch)
-  (display ch)
-  (flush-output-port (current-output-port)))
+  (if (stream3-active?)
+      (stream3-write-char! ch)
+      (begin
+        (display ch)
+        (flush-output-port (current-output-port)))))
 
 (define (z-newline)
-  (newline)
-  (flush-output-port (current-output-port)))
+  (if (stream3-active?)
+      (stream3-write-char! 13)
+      (begin
+        (newline)
+        (flush-output-port (current-output-port)))))
 
 ;;;
 ;;; Object table helpers (V3: 9-byte entries, V4+: 14-byte entries)
@@ -1024,11 +1056,24 @@
     (lambda (ops)
       (set! *buffering* (not (= (car ops) 0)))))
 
-  ;; VAR:19 output_stream number
+  ;; VAR:19 output_stream number [table]
   (vector-set! *op-var* 19
     (lambda (ops)
-      ;; Minimal: ignore stream selection
-      'ok))
+      (let ((stream (s16 (car ops))))
+        (cond
+         ((= stream 3)
+          ;; Enable stream 3: capture to memory table
+          ;; Second operand is the table address
+          (let ((table-addr (cadr ops)))
+            ;; Initialize table: word 0 = 0 (character count)
+            (mem-set-word! table-addr 0)
+            (set! *stream3-stack* (cons table-addr *stream3-stack*))))
+         ((= stream -3)
+          ;; Disable stream 3: pop the table stack
+          (when (not (null? *stream3-stack*))
+            (set! *stream3-stack* (cdr *stream3-stack*))))
+         ;; Other streams: ignore for now
+         (else 'ok)))))
 
   ;; VAR:20 input_stream number
   (vector-set! *op-var* 20

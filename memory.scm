@@ -423,6 +423,7 @@
   (set! *upper-window-height* 0)
   (set! *output-buffer* '())
   (set! *buffering* #t)
+  (set! *stream3-stack* '())
   (set! *random-state* 'random)
   (set! *random-counter* 0)
   (set! *random-seed* 0))
