@@ -817,14 +817,20 @@
   ;; 0OP:5 save ?(label) [V3]
   (vector-set! *op-0op* 5
     (lambda (ops)
-      ;; For now, always fail (branch on false = don't branch)
-      (do-branch! #f)))
+      ;; PC is at the branch data. Save state with PC here so that
+      ;; on restore, do-branch! reads the save's branch and branches.
+      (let ((success (do-save-game *pc*)))
+        (do-branch! success))))
 
   ;; 0OP:6 restore ?(label) [V3]
   (vector-set! *op-0op* 6
     (lambda (ops)
-      ;; For now, always fail
-      (do-branch! #f)))
+      ;; On success: state is restored, PC points to save's branch data,
+      ;; and do-branch! #t will branch as if the save just succeeded.
+      ;; On failure: do-branch! #f reads restore's own branch (no branch taken).
+      (if (do-restore-game)
+          (do-branch! #t)
+          (do-branch! #f))))
 
   ;; 0OP:7 restart
   (vector-set! *op-0op* 7
@@ -1197,16 +1203,33 @@
   ;; EXT:0 save table bytes name prompt -> (result) [V5+]
   (vector-set! *op-ext* 0
     (lambda (ops)
-      (let ((result-var (read-store-target!)))
-        ;; Stub: always fail
-        (set-variable! result-var 0))))
+      (if (null? ops)
+          ;; No operands: full game save
+          (let ((save-pc *pc*))       ; PC at store target byte
+            (let ((result-var (read-store-target!)))
+              ;; Save with PC before store target, so restore can re-read it
+              (if (do-save-game save-pc)
+                  (set-variable! result-var 1)    ; 1 = save succeeded
+                  (set-variable! result-var 0)))) ; 0 = failed
+          ;; With operands: save table to auxiliary file (not yet supported)
+          (let ((result-var (read-store-target!)))
+            (set-variable! result-var 0)))))
 
   ;; EXT:1 restore table bytes name prompt -> (result) [V5+]
   (vector-set! *op-ext* 1
     (lambda (ops)
-      (let ((result-var (read-store-target!)))
-        ;; Stub: always fail
-        (set-variable! result-var 0))))
+      (if (null? ops)
+          ;; No operands: full game restore
+          (let ((result-var (read-store-target!)))
+            (if (do-restore-game)
+                ;; State restored. PC points to save's store target byte.
+                ;; Re-read it and store 2 (distinguishes restore from save).
+                (let ((save-result-var (read-store-target!)))
+                  (set-variable! save-result-var 2))
+                (set-variable! result-var 0)))  ; 0 = failed
+          ;; With operands: restore table from auxiliary file (not yet supported)
+          (let ((result-var (read-store-target!)))
+            (set-variable! result-var 0)))))
 
   ;; EXT:2 log_shift number places -> (result) [V5+]
   (vector-set! *op-ext* 2
