@@ -191,8 +191,8 @@
   (when (>= *version* 4)
     ;; Flags 1 for V4+
     (let ((flags1 (mem-byte 1)))
-      ;; Set bit 0 (colors), bit 2 (bold), bit 3 (italic), bit 4 (fixed), bit 7 (timed input)
-      (mem-set-byte! 1 (bitwise-ior flags1 #b10011101)))
+      ;; Set bit 0 (colors), bit 2 (bold), bit 3 (italic), bit 4 (fixed)
+      (mem-set-byte! 1 (bitwise-ior flags1 #b00011101)))
     ;; Interpreter number 6 (IBM PC) and version 'Z' (ASCII 90)
     (mem-set-byte! #x1E 6)
     (mem-set-byte! #x1F 90)
@@ -209,11 +209,42 @@
     (mem-set-byte! #x2D 9)     ; default foreground = white
     ;; Clear bits in flags 2 for unsupported features
     (let ((flags2 (mem-word #x10)))
-      ;; Clear bit 3 (pictures), bit 5 (mouse), bit 7 (sound), bit 8 (menus)
-      (mem-set-word! #x10 (bitwise-and flags2 (bitwise-not #b101101000)))))
-  ;; Standard revision 1.1
-  (mem-set-byte! #x32 1)
-  (mem-set-byte! #x33 1))
+      ;; Clear bit 0 (transcript), bit 3 (pictures/font3), bit 4 (undo),
+      ;; bit 5 (mouse), bit 7 (sound), bit 8 (menus).
+      (mem-set-word! #x10 (bitwise-and flags2 (bitwise-not #b110111001)))))
+  ;; Do not claim full Standard 1.1 compliance.
+  (mem-set-byte! #x32 0)
+  (mem-set-byte! #x33 0))
+
+(define (flags2-preserved-bits)
+  (bitwise-and (mem-word #x10) #b11))
+
+(define (restore-flags2-preserved-bits! preserved-bits)
+  (mem-set-word! #x10
+                 (bitwise-ior (bitwise-and (mem-word #x10) (bitwise-not #b11))
+                              (bitwise-and preserved-bits #b11))))
+
+(define (story-file-length)
+  (let* ((scale (case *version*
+                  ((1 2 3) 2)
+                  ((4 5) 4)
+                  (else 8)))
+         (header-length (* scale (mem-word #x1A))))
+    (if (= header-length 0)
+        *memory-size*
+        (min header-length *memory-size*))))
+
+(define (story-checksum-matches?)
+  (if (< *version* 3)
+      #t
+      (let ((expected (mem-word #x1C))
+            (file-length (story-file-length)))
+        (if (or (= expected 0) (<= file-length #x40))
+            #t
+            (let loop ((addr #x40) (sum 0))
+              (if (>= addr file-length)
+                  (= (bitwise-and sum #xFFFF) expected)
+                  (loop (+ addr 1) (+ sum (mem-byte addr)))))))))
 
 ;;;
 ;;; Save/Restore
@@ -254,13 +285,36 @@
 (define *save-magic* '(90 83 65 86))  ; "ZSAV"
 (define *save-format-version* 1)
 
+(define (sanitize-filename raw)
+  ;; Per Z-machine spec S 7.6.1.1 and S 7.6.1.3:
+  ;; 1. Convert to uppercase
+  ;; 2. Strip illegal characters (slash, backslash, angle brackets,
+  ;;    colon, double-quote, pipe, question-mark, asterisk)
+  ;; 3. Truncate at first dot (delete dot and everything after)
+  ;; 4. If result is empty, use "NULL"
+  (let* ((upper (string-upcase raw))
+         (stripped (let loop ((i 0) (acc '()))
+                     (if (>= i (string-length upper))
+                         (list->string (reverse acc))
+                         (let ((ch (string-ref upper i)))
+                           (cond
+                            ((char=? ch #\.)
+                             (list->string (reverse acc)))
+                            ((member ch '(#\/ #\\ #\< #\> #\: #\" #\| #\? #\*))
+                             (loop (+ i 1) acc))
+                            (else
+                             (loop (+ i 1) (cons ch acc))))))))
+         (final (if (string=? stripped "") "NULL" stripped)))
+    (let ((dot-pos (string-find-next-char final #\.)))
+      (if dot-pos (substring final 0 dot-pos) final))))
+
 (define (prompt-save-filename)
   (display "Save filename [save.zsav]: ")
   (flush-output-port (current-output-port))
   (let ((line (read-line (current-input-port))))
     (if (or (eof-object? line) (string=? line ""))
         "save.zsav"
-        line)))
+        (sanitize-filename line))))
 
 (define (prompt-restore-filename)
   (display "Restore filename [save.zsav]: ")
@@ -268,7 +322,7 @@
   (let ((line (read-line (current-input-port))))
     (if (or (eof-object? line) (string=? line ""))
         "save.zsav"
-        line)))
+        (sanitize-filename line))))
 
 (define (do-save-game saved-pc)
   ;; Save game state to file. saved-pc is the PC to resume at on restore.
@@ -342,12 +396,14 @@
     (when (not (= ver *version*))
       (error "Save is for a different Z-machine version" ver)))
   (let* ((saved-static-base (read-u32! port))
-         (saved-pc (read-u32! port)))
+         (saved-pc (read-u32! port))
+         (preserved-flags2 (flags2-preserved-bits)))
     (when (not (= saved-static-base *static-mem-base*))
       (error "Save has different static memory base"))
     (let ((mem-data (read-bytevector *static-mem-base* port)))
       (bytevector-copy! *memory* 0 mem-data))
     (setup-header-flags!)
+    (restore-flags2-preserved-bits! preserved-flags2)
     (let ((stack-depth (read-u32! port)))
       (set! *stack*
             (let loop ((i 0) (acc '()))
@@ -409,8 +465,10 @@
 
 (define (do-restart!)
   ;; Restore dynamic memory to original state and reset machine.
+  (let ((preserved-flags2 (flags2-preserved-bits)))
   (bytevector-copy! *memory* 0 *original-dynamic-memory*)
   (setup-header-flags!)
+  (restore-flags2-preserved-bits! preserved-flags2)
   (set! *pc* *initial-pc*)
   (set! *stack* '())
   (set! *call-stack* '())
@@ -423,10 +481,16 @@
   (set! *upper-window-height* 0)
   (set! *output-buffer* '())
   (set! *buffering* #t)
+  (set! *stream2-active?* #f)
+  (set! *stream2-warning-shown?* #f)
   (set! *stream3-stack* '())
+  (set! *input-stream* 0)
+  (when (not (null? *transcript-port*))
+    (guard (exn (#t 'ok)) (close-output-port *transcript-port*))
+    (set! *transcript-port* '()))
   (set! *random-state* 'random)
   (set! *random-counter* 0)
-  (set! *random-seed* 0))
+  (set! *random-seed* 0)))
 
 ;;;
 ;;; Story file loading

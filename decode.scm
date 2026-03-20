@@ -10,6 +10,77 @@
 (define *a2* " \n0123456789.,!?_#'\"/\\-:()")  ; Z-chars 6-31
 ;; Note: A2 char 6 = ZSCII escape (handled specially), char 7 = newline
 
+(define *default-unicode-table*
+  '#(#x00E4 #x00F6 #x00FC #x00C4 #x00D6 #x00DC #x00DF #x00BB #x00AB #x00EB
+     #x00EF #x00FF #x00CB #x00CF #x00E1 #x00E9 #x00ED #x00F3 #x00FA #x00FD
+     #x00C1 #x00C9 #x00CD #x00D3 #x00DA #x00DD #x00E0 #x00E8 #x00EC #x00F2
+     #x00F9 #x00C0 #x00C8 #x00CC #x00D2 #x00D9 #x00E2 #x00EA #x00EE #x00F4
+     #x00FB #x00C2 #x00CA #x00CE #x00D4 #x00DB #x00E5 #x00C5 #x00F8 #x00D8
+     #x00E3 #x00F1 #x00F5 #x00C3 #x00D1 #x00D5 #x00E6 #x00C6 #x00E7 #x00C7
+     #x00FE #x00F0 #x00DE #x00D0 #x00A3 #x0153 #x0152 #x00A1 #x00BF))
+
+(define (header-extension-word word-num)
+  (let ((table-addr (mem-word #x36)))
+    (if (= table-addr 0)
+        0
+        (let ((count (mem-word table-addr)))
+          (if (< count word-num)
+              0
+              (mem-word (+ table-addr (* 2 word-num))))))))
+
+(define (unicode-translation-table-addr)
+  (if (>= *version* 5)
+      (header-extension-word 3)
+      0))
+
+(define (zscii-extra->unicode code)
+  (let ((table-addr (unicode-translation-table-addr)))
+    (if (not (= table-addr 0))
+        (let ((count (mem-byte table-addr))
+              (index (- code 155)))
+          (if (and (>= index 0) (< index count))
+              (mem-word (+ table-addr 1 (* 2 index)))
+              #f))
+        (let ((index (- code 155)))
+          (if (and (>= index 0) (< index (vector-length *default-unicode-table*)))
+              (vector-ref *default-unicode-table* index)
+              #f)))))
+
+(define (unicode->zscii-extra codepoint)
+  (let ((table-addr (unicode-translation-table-addr)))
+    (if (not (= table-addr 0))
+        (let ((count (mem-byte table-addr)))
+          (let loop ((i 0))
+            (cond
+             ((>= i count) #f)
+             ((= (mem-word (+ table-addr 1 (* 2 i))) codepoint) (+ 155 i))
+             (else (loop (+ i 1))))))
+        (let loop ((i 0))
+          (cond
+           ((>= i (vector-length *default-unicode-table*)) #f)
+           ((= (vector-ref *default-unicode-table* i) codepoint) (+ 155 i))
+           (else (loop (+ i 1))))))))
+
+(define (zscii-output-code->char code)
+  (cond
+   ((= code 0) #f)
+   ((= code 13) #\newline)
+   ((and (>= code 32) (<= code 126)) (integer->char code))
+   ((and (>= code 155) (<= code 251))
+    (let ((unicode (zscii-extra->unicode code)))
+      (if unicode (integer->char unicode) #\?)))
+   (else #\?)))
+
+(define (char->zscii-output-code ch)
+  (let ((codepoint (char->integer ch)))
+    (cond
+     ((= codepoint 10) 13)
+     ((or (= codepoint 0) (= codepoint 13)) codepoint)
+     ((and (>= codepoint 32) (<= codepoint 126)) codepoint)
+     (else
+      (let ((zscii (unicode->zscii-extra codepoint)))
+        (if zscii zscii 63))))))
+
 ;; Unpack a 2-byte word into three 5-bit Z-characters
 ;; Returns (list z1 z2 z3 end-bit?)
 (define (unpack-zword word)
@@ -55,11 +126,12 @@
          ((eq? tenbit-stage 'high)
           (set! tenbit-stage z))  ; save high 5 bits
          (else
-          ;; tenbit-stage has high 5 bits, z has low 5 bits
-          (let ((code (bitwise-ior (arithmetic-shift tenbit-stage 5) z)))
-            (when (and (>= code 32) (<= code 126))
-              (emit-char (integer->char code))))
-          (set! tenbit-stage #f))))
+           ;; tenbit-stage has high 5 bits, z has low 5 bits
+           (let ((code (bitwise-ior (arithmetic-shift tenbit-stage 5) z)))
+             (let ((ch (zscii-output-code->char code)))
+               (when ch
+                 (emit-char ch))))
+           (set! tenbit-stage #f))))
 
        ;; Abbreviation pending
        (abbrev-pending

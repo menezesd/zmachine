@@ -38,20 +38,51 @@
 (define *buffering* #t)
 (define *current-window* 0)       ; 0 = lower, 1 = upper
 (define *upper-window-height* 0)  ; height of upper window in lines
-
-;; Output stream 3: capture to memory table
+(define *stream2-supported?* #f)
+(define *stream2-active?* #f)
+(define *stream2-warning-shown?* #f)
+(define *input-stream* 0)   ; 0 = none (keyboard only)
+(define *transcript-port* '())  ; closed-port sentinel for stream 2 output
 ;; Stack of table addresses (stream 3 can nest up to 16 levels)
 (define *stream3-stack* '())
 
 (define (stream3-active?)
   (not (null? *stream3-stack*)))
 
+(define (sync-stream2-flag!)
+  (let ((flags2 (mem-word #x10)))
+    (mem-set-word! #x10
+                   (if *stream2-active?*
+                       (bitwise-ior flags2 #b1)
+                       (bitwise-and flags2 (bitwise-not #b1))))))
+
+(define (set-stream2-active! active?)
+  (set! *stream2-active?* (and *stream2-supported?* active?))
+  (sync-stream2-flag!)
+  (cond
+   ((and *stream2-active?* (null? *transcript-port*))
+    ;; Open transcript file (append mode)
+    (guard (exn (#t (set! *stream2-active?* #f) (sync-stream2-flag!)))
+      (set! *transcript-port* (open-output-file "transcript.txt" 'append))))
+   ((and (not *stream2-active?*) (not (null? *transcript-port*)))
+    ;; Close transcript file
+    (guard (exn (#t 'ok))
+      (close-output-port *transcript-port*))
+    (set! *transcript-port* '()))))
+
+(define (warn-stream2-unsupported!)
+  (when (not *stream2-warning-shown?*)
+    (display "[transcript output unavailable]")
+    (newline)
+    (flush-output-port (current-output-port))
+    (set! *stream2-warning-shown?* #t)))
+
 (define (stream3-write-char! ch)
   ;; Append a ZSCII character to the current stream 3 table.
   ;; Table format: word 0 = character count, then characters as bytes.
   (let* ((table-addr (car *stream3-stack*))
          (count (mem-word table-addr))
-         (char-code (if (char? ch) (char->integer ch) ch)))
+         (char-code (if (char? ch) (char->zscii-output-code ch) ch)))
     (mem-set-byte! (+ table-addr 2 count) char-code)
     (mem-set-word! table-addr (+ count 1))))
 
@@ -62,26 +93,59 @@
         (stream3-write-char! (string-ref str i))
         (loop (+ i 1))))))
 
+(define (route-to-streams str)
+  ;; Route a string to all active output streams per Z-machine spec S7.
+  ;; Stream 3 silences all others. Stream 2 echoes to transcript file.
+  (cond
+   ((stream3-active?)
+    ;; Stream 3 suppresses all other streams while active
+    'ok)
+   ((and *stream2-active?* (not (null? *transcript-port*)))
+    ;; Stream 2: echo to both terminal and transcript file
+    (display str)
+    (display str *transcript-port*)
+    (flush-output-port (current-output-port))
+    (flush-output-port *transcript-port*))
+   (*stream2-active?*
+    ;; Stream 2 active but transcript not open: just warn once
+    (display str)
+    (flush-output-port (current-output-port))
+    (warn-stream2-unsupported!))
+   (else
+    (display str)
+    (flush-output-port (current-output-port)))))
+
+(define (route-char-to-streams ch)
+  (cond
+   ((stream3-active?)
+    'ok)
+   ((and *stream2-active?* (not (null? *transcript-port*)))
+    (display ch)
+    (write-char ch *transcript-port*)
+    (flush-output-port (current-output-port))
+    (flush-output-port *transcript-port*))
+   (*stream2-active?*
+    (display ch)
+    (flush-output-port (current-output-port))
+    (warn-stream2-unsupported!))
+   (else
+    (display ch)
+    (flush-output-port (current-output-port)))))
+
 (define (z-print str)
   (if (stream3-active?)
       (stream3-write-string! str)
-      (begin
-        (display str)
-        (flush-output-port (current-output-port)))))
+      (route-to-streams str)))
 
 (define (z-print-char ch)
   (if (stream3-active?)
       (stream3-write-char! ch)
-      (begin
-        (display ch)
-        (flush-output-port (current-output-port)))))
+      (route-char-to-streams ch)))
 
 (define (z-newline)
   (if (stream3-active?)
       (stream3-write-char! 13)
-      (begin
-        (newline)
-        (flush-output-port (current-output-port)))))
+      (route-char-to-streams #\newline)))
 
 ;;;
 ;;; Object table helpers (V3: 9-byte entries, V4+: 14-byte entries)
@@ -478,12 +542,16 @@
            (val2 (mem-word (+ *globals-addr* 4)))          ; global 2
            (is-time (bit-set? 1 (mem-byte 1)))
            (right-side (if is-time
-                           (string-append "Time: "
-                                          (number->string (modulo val1 12))
-                                          ":"
-                                          (if (< val2 10) "0" "")
-                                          (number->string val2)
-                                          (if (>= val1 12) " PM" " AM"))
+                           (let* ((hours val2)
+                                  (minutes val1)
+                                  (display-hour (modulo hours 12))
+                                  (display-hour (if (= display-hour 0) 12 display-hour)))
+                             (string-append "Time: "
+                                            (number->string display-hour)
+                                            ":"
+                                            (if (< minutes 10) "0" "")
+                                            (number->string minutes)
+                                            (if (>= hours 12) " PM" " AM")))
                            (string-append "Score: " (number->string val1)
                                           "  Turns: " (number->string val2))))
            (width 80)
@@ -531,13 +599,16 @@
   ;; Show status line first (V3 requirement)
   (when (<= *version* 3) (show-status-line))
   ;; Read a line of input
-  (display ">")
-  (flush-output-port (current-output-port))
   (let* ((line (read-line))
-         (line (if (eof-object? line) "quit" line))
-         (line (string-downcase line))
-         (max-len (- (mem-byte text-buf) 1))  ; leave room
-         (len (min (string-length line) max-len)))
+          (line (if (eof-object? line) "quit" line))
+          (line (string-downcase line))
+          (max-len (if (<= *version* 4)
+                       (- (mem-byte text-buf) 1)
+                       (mem-byte text-buf)))
+          (len (min (string-length line) max-len)))
+    (when (and (<= *version* 5) *stream2-active?*)
+      (z-print line)
+      (z-newline))
     (if (<= *version* 4)
         ;; V1-4: store characters starting at byte 1, zero-terminate
         (begin
@@ -901,8 +972,7 @@
   ;; 0OP:13 verify ?(label)
   (vector-set! *op-0op* 13
     (lambda (ops)
-      ;; Always pass verification for now
-      (do-branch! #t)))
+      (do-branch! (story-checksum-matches?))))
 
   ;; 0OP:15 piracy ?(label)
   (vector-set! *op-0op* 15
@@ -948,10 +1018,10 @@
   (vector-set! *op-var* 5
     (lambda (ops)
       (let ((code (car ops)))
-        (when (and (>= code 32) (<= code 126))
-          (z-print-char (integer->char code)))
-        (when (= code 13)
-          (z-newline)))))
+        (let ((ch (zscii-output-code->char code)))
+          (cond
+           ((= code 13) (z-newline))
+           (ch (z-print-char ch)))))))
 
   ;; VAR:6 print_num value
   (vector-set! *op-var* 6
@@ -1061,13 +1131,23 @@
     (lambda (ops)
       (let ((stream (s16 (car ops))))
         (cond
+         ((= stream 2)
+          (if *stream2-supported?*
+              (set-stream2-active! #t)
+              (begin
+                (set-stream2-active! #f)
+                (warn-stream2-unsupported!))))
+         ((= stream -2)
+          (set-stream2-active! #f))
          ((= stream 3)
-          ;; Enable stream 3: capture to memory table
-          ;; Second operand is the table address
-          (let ((table-addr (cadr ops)))
-            ;; Initialize table: word 0 = 0 (character count)
-            (mem-set-word! table-addr 0)
-            (set! *stream3-stack* (cons table-addr *stream3-stack*))))
+           ;; Enable stream 3: capture to memory table
+           ;; Second operand is the table address
+           (let ((table-addr (cadr ops)))
+             (when (>= (length *stream3-stack*) 16)
+               (error "output_stream 3 nesting overflow"))
+             ;; Initialize table: word 0 = 0 (character count)
+             (mem-set-word! table-addr 0)
+             (set! *stream3-stack* (cons table-addr *stream3-stack*))))
          ((= stream -3)
           ;; Disable stream 3: pop the table stack
           (when (not (null? *stream3-stack*))
@@ -1078,8 +1158,19 @@
   ;; VAR:20 input_stream number
   (vector-set! *op-var* 20
     (lambda (ops)
-      ;; Minimal: ignore
-      'ok))
+      (let ((stream (car ops)))
+        (cond
+         ((= stream 0)
+          ;; Deselect current input stream
+          (set! *input-stream* 0))
+         ((= stream 1)
+          ;; Select keyboard input stream
+          (set! *input-stream* 1))
+         (else
+          ;; Unknown input stream: ignore silently
+          'ok))
+        ;; Return the current input stream number
+        *input-stream*)))
 
   ;; VAR:21 sound_effect
   (vector-set! *op-var* 21
@@ -1123,7 +1214,9 @@
   ;; VAR:27 tokenise text parse [V5+]
   (vector-set! *op-var* 27
     (lambda (ops)
-      (tokenize-input (car ops) (cadr ops))))
+      (if (>= *version* 5)
+          (tokenize-input-v5 (car ops) (cadr ops))
+          (tokenize-input (car ops) (cadr ops)))))
 
   ;; VAR:29 copy_table first second size [V5+]
   (vector-set! *op-var* 29
@@ -1133,24 +1226,29 @@
             (size (s16 (caddr ops))))
         (cond
          ((= second 0)
-          ;; Zero out first table
-          (let loop ((i 0))
-            (when (< i (abs size))
-              (mem-set-byte! (+ first i) 0)
-              (loop (+ i 1)))))
+           ;; Zero out first table
+           (let loop ((i 0))
+             (when (< i (abs size))
+               (mem-set-byte! (+ first i) 0)
+               (loop (+ i 1)))))
          ((> size 0)
-          ;; Copy forward (safe for non-overlapping or dest < src)
-          (let loop ((i 0))
-            (when (< i size)
-              (mem-set-byte! (+ second i) (mem-byte (+ first i)))
-              (loop (+ i 1)))))
-         (else
-          ;; Negative size: copy backward (for overlapping regions)
-          (let ((asize (abs size)))
-            (let loop ((i (- asize 1)))
-              (when (>= i 0)
+          ;; Copy in a direction that avoids corrupting the source.
+          (if (and (> second first) (< second (+ first size)))
+              (let loop ((i (- size 1)))
+                (when (>= i 0)
+                  (mem-set-byte! (+ second i) (mem-byte (+ first i)))
+                  (loop (- i 1))))
+              (let loop ((i 0))
+                (when (< i size)
+                  (mem-set-byte! (+ second i) (mem-byte (+ first i)))
+                  (loop (+ i 1))))))
+          (else
+          ;; Negative size: copy forward even if this corrupts the source.
+           (let ((asize (abs size)))
+            (let loop ((i 0))
+              (when (< i asize)
                 (mem-set-byte! (+ second i) (mem-byte (+ first i)))
-                (loop (- i 1))))))))))
+                (loop (+ i 1))))))))))
 
   ;; VAR:30 print_table zscii-text width height skip [V5+]
   (vector-set! *op-var* 30
