@@ -2,12 +2,25 @@
 ;;;
 ;;; Usage: mit-scheme --load zmachine.scm -- <story-file>
 ;;;
+;;; Note: must be started from this directory; the `load` calls below
+;;; resolve relative to the working directory (MIT Scheme gives us no
+;;; reliable way to locate the script itself under --load).
 
 (load "memory")
 (load "decode")
 (load "ops")
 
 (define *trace* #f)  ; Set to #t for instruction tracing
+
+(define (setup-game-input!)
+  ;; Reading EOF from MIT Scheme's console port (terminal OR pipe)
+  ;; aborts the whole process ("End of input stream reached") instead
+  ;; of returning an eof-object. Reopen /dev/stdin as an ordinary file
+  ;; port, which behaves properly at end-of-file; fall back to the
+  ;; console port where /dev/stdin is unavailable.
+  (set! *game-input-port*
+        (guard (exn (#t (current-input-port)))
+          (open-input-file "/dev/stdin"))))
 
 (define (main-loop)
   (let loop ()
@@ -26,6 +39,7 @@
       (loop))))
 
 (define (run-zmachine filename)
+  (setup-game-input!)
   (display (string-append "Loading " filename "...\n"))
   (load-story-file filename)
   (display (string-append "Z-Machine version " (number->string *version*) "\n"))
@@ -38,9 +52,9 @@
   (display (string-append "Abbreviations: $" (number->string *abbrev-table-addr* 16) "\n"))
   (newline)
   (init-opcodes!)
-  ;; Clear screen for V3
+  ;; Clear screen for V3 (also resets any scroll region left over)
   (when (= *version* 3)
-    (display "\033[2J\033[1;1H")
+    (display "\033[r\033[2J\033[1;1H")
     (flush-output-port (current-output-port)))
   (main-loop)
   (newline)

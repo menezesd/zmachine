@@ -201,20 +201,22 @@
          (zchars (string->zchars (string-downcase str) target-zchars)))
     (zchars->bytes zchars)))
 
-(define (string->zchars str max-zchars)
-  ;; Convert string to Z-character list, padded to max-zchars with 5s
-  (let loop ((chars (string->list str)) (zchars '()) (count 0))
-    (if (or (null? chars) (>= count max-zchars))
-        ;; Pad with 5s
-        (let pad ((zc (reverse zchars)))
-          (if (>= (length zc) max-zchars)
-              zc
-              (pad (append zc (list 5)))))
-        (let* ((ch (car chars))
-               (new-zchars (char->zchars ch)))
-          (loop (cdr chars)
-                (append (reverse new-zchars) zchars)
-                (+ count (length new-zchars)))))))
+(define (string->zchars str max-zchar)
+  ;; Convert a string to a list of exactly max-zchar Z-characters.
+  ;; Per spec S3.7 / S15 encode_text: longer expansions are chopped,
+  ;; shorter ones are padded out with 5s. Collecting everything first
+  ;; and trimming afterwards guarantees the list length is exactly
+  ;; max-zchar (a multiple of 3), so zchars->bytes always gets a whole
+  ;; number of words.
+  (let ((zchars (let loop ((chars (string->list str)) (acc '()))
+                  (if (null? chars)
+                      acc            ; append already keeps forward order
+                      (loop (cdr chars)
+                            (append acc (char->zchars (car chars))))))))
+    (let trim ((zc zchars) (n 0))
+      (cond ((= n max-zchar) '())
+            ((null? zc) (make-list (- max-zchar n) 5))
+            (else (cons (car zc) (trim (cdr zc) (+ n 1))))))))
 
 (define (char->zchars ch)
   ;; Convert a single character to a list of Z-characters

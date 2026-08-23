@@ -35,9 +35,19 @@
 ;;;
 
 (define *output-buffer* '())
-(define *buffering* #t)
 (define *current-window* 0)       ; 0 = lower, 1 = upper
 (define *upper-window-height* 0)  ; height of upper window in lines
+;; Approximate cursor position within the upper window. The terminal
+;; advances the real cursor for us; these track only explicit moves
+;; (set_cursor, window selection), which is what get_cursor callers use.
+(define *win1-row* 1)
+(define *win1-col* 1)
+;; Current V4+ text style bitmask (1=reverse 2=bold 4=italic 8=fixed).
+(define *current-style* 0)
+;; Port serving game input. Replaced by run-zmachine with /dev/stdin
+;; reopened as a file port: console-port EOF aborts the process, while
+;; file ports yield ordinary eof-objects that z-read/read_char handle.
+(define *game-input-port* (current-input-port))
 (define *stream2-supported?* #f)
 (define *stream2-active?* #f)
 (define *stream2-warning-shown?* #f)
@@ -48,6 +58,17 @@
 
 (define (stream3-active?)
   (not (null? *stream3-stack*)))
+
+(define (emit-style-ansi! style)
+  ;; Emit ANSI escapes realizing a V4+ style bitmask
+  ;; (1=reverse 2=bold 4=italic 8=fixed-pitch). Always rebuilds from a
+  ;; reset so composite styles (e.g. reverse+bold) compose correctly.
+  (display "\033[0m")
+  (when (not (= (bitwise-and style 1) 0)) (display "\033[7m"))
+  (when (not (= (bitwise-and style 2) 0)) (display "\033[1m"))
+  (when (not (= (bitwise-and style 4) 0)) (display "\033[4m"))
+  ;; Fixed-pitch (8): terminal fonts are fixed-width; nothing to do.
+  'ok)
 
 (define (sync-stream2-flag!)
   (let ((flags2 (mem-word #x10)))
@@ -411,22 +432,35 @@
   (+ *dictionary-addr* 4 (mem-byte *dictionary-addr*)))
 
 (define (dict-lookup encoded-bytes)
-  ;; Binary search the dictionary. encoded-bytes is a bytevector of 4 bytes (V3).
-  ;; Returns the dictionary address of the entry, or 0 if not found.
-  (let* ((num-entries (abs (dict-num-entries)))
+  ;; Search the dictionary for encoded-bytes (a bytevector, 4 bytes V3 /
+  ;; 6 bytes V5+). Returns the dictionary address of the entry, or 0.
+  ;; A negative entry count means the dictionary is UNSORTED and must be
+  ;; searched linearly (spec S13.6).
+  (let* ((count-raw (dict-num-entries))
+         (sorted? (>= count-raw 0))
+         (num-entries (abs count-raw))
          (entry-len (dict-entry-length))
          (base (dict-entries-start))
-         (encoded-len (bytevector-length encoded-bytes)))
-    (let search ((lo 0) (hi (- num-entries 1)))
-      (if (> lo hi)
-          0
-          (let* ((mid (quotient (+ lo hi) 2))
-                 (addr (+ base (* mid entry-len)))
-                 (cmp (compare-encoded addr encoded-bytes encoded-len)))
-            (cond
-             ((= cmp 0) addr)
-             ((< cmp 0) (search (+ mid 1) hi))
-             (else (search lo (- mid 1)))))))))
+         (encoded-len (bytevector-length encoded-bytes))
+         (cmp-at (lambda (addr)
+                   (compare-encoded addr encoded-bytes encoded-len))))
+    (if sorted?
+        (let search ((lo 0) (hi (- num-entries 1)))
+          (if (> lo hi)
+              0
+              (let* ((mid (quotient (+ lo hi) 2))
+                     (addr (+ base (* mid entry-len)))
+                     (cmp (cmp-at addr)))
+                (cond
+                 ((= cmp 0) addr)
+                 ((< cmp 0) (search (+ mid 1) hi))
+                 (else (search lo (- mid 1)))))))
+        (let loop ((i 0))
+          (cond
+           ((>= i num-entries) 0)
+           ((= (cmp-at (+ base (* i entry-len))) 0)
+            (+ base (* i entry-len)))
+           (else (loop (+ i 1))))))))
 
 (define (compare-encoded dict-addr encoded-bytes len)
   ;; Compare encoded bytes at dict-addr with encoded-bytes
@@ -537,13 +571,15 @@
 (define (show-status-line)
   (when (= *version* 3)
     (let* ((loc-obj (mem-word *globals-addr*))  ; global 0 = first global variable
-           (loc-name (if (> loc-obj 0) (obj-short-name loc-obj) "???"))
            (val1 (s16 (mem-word (+ *globals-addr* 2))))   ; global 1
            (val2 (mem-word (+ *globals-addr* 4)))          ; global 2
            (is-time (bit-set? 1 (mem-byte 1)))
            (right-side (if is-time
-                           (let* ((hours val2)
-                                  (minutes val1)
+                           ;; Spec S15 show_status: in time mode
+                           ;; global 17 holds HOURS and global 18 MINUTES.
+                           ;; (Score mode: score=17, turns=18.)
+                           (let* ((hours val1)
+                                  (minutes val2)
                                   (display-hour (modulo hours 12))
                                   (display-hour (if (= display-hour 0) 12 display-hour)))
                              (string-append "Time: "
@@ -555,41 +591,65 @@
                            (string-append "Score: " (number->string val1)
                                           "  Turns: " (number->string val2))))
            (width 80)
+           (loc-name0 (if (> loc-obj 0) (obj-short-name loc-obj) "???"))
+           ;; Truncate a long location name so the strip never wraps
+           (avail (max 1 (- width 2 (string-length right-side))))
+           (loc-name (if (> (string-length loc-name0) avail)
+                         (substring loc-name0 0 avail)
+                         loc-name0))
            (padding (max 1 (- width (string-length loc-name) (string-length right-side)))))
       ;; ANSI: save cursor, move to 1,1, reverse video
       (display "\033[s\033[1;1H\033[7m ")
       (display loc-name)
       (display (make-string padding #\space))
       (display right-side)
-      (display " \033[0m\033[u")
+      (display " \033[0m")
+      ;; Restore whatever text style the game had active
+      (when (not (= *current-style* 0)) (emit-style-ansi! *current-style*))
+      (display "\033[u")
       (flush-output-port (current-output-port)))))
 
 ;;;
 ;;; Random number generator
 ;;;
+;;; Mirrors common interpreter practice exactly so that saved-game state
+;;; agrees across interpreters: seeds -1..-999 select a cycling counter
+;;; over that interval, seeds -1000 and below seed the classic 32-bit
+;;; LCG, and 0 reseeds from the clock.
+;;;
 
-(define *random-state* 'random)
-(define *random-counter* 0)
-(define *random-seed* 0)
+(define *rng-a* 1)            ; LCG state
+(define *rng-interval* 0)     ; special-mode cycle length (0 = LCG mode)
+(define *rng-counter* 0)      ; special-mode position
 
 (define (z-random range)
   (cond
    ((<= range 0)
-    ;; Seed the RNG
+    ;; Seed the RNG. Value 0 asks for a genuinely random seed.
     (let ((seed (- range)))
-      (if (= seed 0)
-          (set! *random-state* 'random)
-          (begin
-            (set! *random-state* 'predictable)
-            (set! *random-seed* seed)
-            (set! *random-counter* 0)))
-      0))
-   ((eq? *random-state* 'random)
-    (+ 1 (random range)))
+      (cond ((= seed 0)
+             (set! *rng-a*
+                   (modulo (get-internal-real-time) #xFFFFFFFF))
+             (set! *rng-interval* 0))
+            ((< seed 1000)
+             (set! *rng-counter* 0)
+             (set! *rng-interval* seed))
+            (else
+             (set! *rng-a* seed)
+             (set! *rng-interval* 0))))
+    0)
+   ((not (= *rng-interval* 0))
+    ;; Special mode: consecutive values cycling over the interval.
+    (let ((result *rng-counter*))
+      (set! *rng-counter* (+ result 1))
+      (when (= *rng-counter* *rng-interval*)
+        (set! *rng-counter* 0))
+      (+ 1 (modulo result range))))
    (else
-    ;; Predictable mode
-    (set! *random-counter* (+ *random-counter* 1))
-    (+ 1 (modulo (- *random-counter* 1) range)))))
+    ;; Standard mode: LCG, keeping the state to 32 bits like C.
+    (set! *rng-a* (modulo (+ (* #x015a4e35 *rng-a*) 1) #x100000000))
+    (+ 1 (modulo (bitwise-and (arithmetic-shift *rng-a* -16) #x7FFF)
+                 range)))))
 
 ;;;
 ;;; Input handling
@@ -598,17 +658,25 @@
 (define (z-read text-buf parse-buf)
   ;; Show status line first (V3 requirement)
   (when (<= *version* 3) (show-status-line))
-  ;; Read a line of input
-  (let* ((line (read-line))
-          (line (if (eof-object? line) "quit" line))
-          (line (string-downcase line))
-          (max-len (if (<= *version* 4)
-                       (- (mem-byte text-buf) 1)
-                       (mem-byte text-buf)))
-          (len (min (string-length line) max-len)))
-    (when (and (<= *version* 5) *stream2-active?*)
-      (z-print line)
-      (z-newline))
+  ;; Read a line of game input. On EOF we shut the machine down
+  ;; cleanly instead of feeding the game a fake command.
+  (let* ((raw (read-line *game-input-port*))
+         (eof? (eof-object? raw))
+         (line (if eof? "" (string-downcase raw)))
+         (max-len (if (<= *version* 4)
+                      (- (mem-byte text-buf) 1)
+                      (mem-byte text-buf)))
+         (len (min (string-length line) max-len)))
+    (when eof?
+      (display "\n[End of input]\n")
+      (flush-output-port (current-output-port))
+      (set! *running* #f))
+    ;; Echo typed input to the transcript only; the terminal already
+    ;; echoed it as the player typed. Spec S7.2 applies to all versions.
+    (when (and *stream2-active?* (not (null? *transcript-port*)))
+      (display line *transcript-port*)
+      (write-char #\newline *transcript-port*)
+      (flush-output-port *transcript-port*))
     (if (<= *version* 4)
         ;; V1-4: store characters starting at byte 1, zero-terminate
         (begin
@@ -939,8 +1007,8 @@
   (vector-set! *op-0op* 7
     (lambda (ops)
       (do-restart!)
-      ;; Clear screen and resume from initial PC
-      (display "\033[2J\033[1;1H")
+      ;; Clear screen, reset scroll region, resume from initial PC
+      (display "\033[r\033[2J\033[1;1H")
       (flush-output-port (current-output-port))))
 
   ;; 0OP:8 ret_popped
@@ -1054,15 +1122,22 @@
     (lambda (ops)
       (let ((win (car ops)))
         (set! *current-window* win)
-        ;; When selecting upper window, reset cursor to top-left
+        ;; When selecting upper window, reset cursor to top-left and
+        ;; confine scrolling to rows 1..height, so overflowing window-1
+        ;; text scrolls only the upper window (spec S8.3).
         (when (= win 1)
           (display "\033[s")  ; save lower window cursor
           (display "\033[1;1H")
-          (flush-output-port (current-output-port)))
-        ;; When selecting lower window, restore cursor
+          (display (string-append "\033[1;"
+                                  (number->string (max 1 *upper-window-height*)) "r"))
+          (set! *win1-row* 1)
+          (set! *win1-col* 1))
+        ;; When selecting lower window, restore full-screen scrolling
+        ;; first, then the cursor.
         (when (= win 0)
-          (display "\033[u")  ; restore cursor
-          (flush-output-port (current-output-port))))))
+          (display "\033[r")
+          (display "\033[u"))  ; restore cursor
+        (flush-output-port (current-output-port)))))
 
   ;; VAR:13 erase_window window [V4+]
   (vector-set! *op-var* 13
@@ -1073,7 +1148,10 @@
           ;; Clear whole screen, collapse upper window, select lower
           (set! *upper-window-height* 0)
           (set! *current-window* 0)
+          (display "\033[r")  ; restore full-screen scroll region
           (display "\033[2J\033[1;1H")
+          (set! *win1-row* 1)
+          (set! *win1-col* 1)
           (flush-output-port (current-output-port)))
          ((= win -2)
           ;; Clear screen without changing windows
@@ -1090,6 +1168,8 @@
             (when (<= row *upper-window-height*)
               (display (string-append "\033[" (number->string row) ";1H\033[K"))
               (loop (+ row 1))))
+          (set! *win1-row* 1)
+          (set! *win1-col* 1)
           (flush-output-port (current-output-port)))))))
 
   ;; VAR:14 erase_line value [V4+]
@@ -1104,27 +1184,43 @@
     (lambda (ops)
       ;; ANSI cursor positioning (only effective in upper window)
       (when (= *current-window* 1)
-        (display (string-append "\033[" (number->string (car ops))
-                                ";" (number->string (cadr ops)) "H"))
-        (flush-output-port (current-output-port)))))
+        ;; Clamp to the window height so games can't park the cursor
+        ;; below the split.
+        (let ((row (min (car ops) (max 1 *upper-window-height*)))
+              (col (cadr ops)))
+          (set! *win1-row* row)
+          (set! *win1-col* col)
+          (display (string-append "\033[" (number->string row)
+                                  ";" (number->string col) "H"))
+          (flush-output-port (current-output-port))))))
+
+  ;; VAR:16 get_cursor array [V4+]
+  (vector-set! *op-var* 16
+    (lambda (ops)
+      ;; Write approximate cursor row/word into word 0, column into
+      ;; word 1 of the array. Tracking covers explicit moves only;
+      ;; free-form text output advances the terminal cursor invisibly
+      ;; to us. Games calling get_cursor do so right after positioning,
+      ;; which we do track.
+      (let ((addr (car ops)))
+        (mem-set-word! addr *win1-row*)
+        (mem-set-word! (+ addr 2) *win1-col*))))
 
   ;; VAR:17 set_text_style style [V4+]
   (vector-set! *op-var* 17
     (lambda (ops)
-      ;; 0=Roman, 1=Reverse, 2=Bold, 4=Italic, 8=Fixed
+      ;; Style bits: 1=Reverse, 2=Bold, 4=Italic, 8=Fixed-pitch.
       (let ((style (car ops)))
-        (cond
-         ((= style 0) (display "\033[0m"))
-         ((= style 1) (display "\033[7m"))
-         ((= style 2) (display "\033[1m"))
-         ((= style 4) (display "\033[4m"))  ; italic as underline
-         ((= style 8) 'ok))  ; fixed-pitch, ignore
+        (set! *current-style* (if (= style 0) 0 style))
+        (emit-style-ansi! *current-style*)
         (flush-output-port (current-output-port)))))
 
   ;; VAR:18 buffer_mode flag [V4+]
   (vector-set! *op-var* 18
     (lambda (ops)
-      (set! *buffering* (not (= (car ops) 0)))))
+      ;; Output is unbuffered character-at-a-time; the terminal does its
+      ;; own wrapping, so there is no buffer state to toggle here.
+      'ok))
 
   ;; VAR:19 output_stream number [table]
   (vector-set! *op-var* 19
@@ -1140,14 +1236,16 @@
          ((= stream -2)
           (set-stream2-active! #f))
          ((= stream 3)
-           ;; Enable stream 3: capture to memory table
-           ;; Second operand is the table address
-           (let ((table-addr (cadr ops)))
-             (when (>= (length *stream3-stack*) 16)
-               (error "output_stream 3 nesting overflow"))
-             ;; Initialize table: word 0 = 0 (character count)
-             (mem-set-word! table-addr 0)
-             (set! *stream3-stack* (cons table-addr *stream3-stack*))))
+           ;; Enable stream 3: capture to memory table. Spec S15 allows
+           ;; up to 16 nested tables; further requests are ignored
+           ;; rather than treated as fatal.
+           (if (< (length ops) 2)
+               'ok  ; malformed call: no table address given
+               (let ((table-addr (cadr ops)))
+                 (when (< (length *stream3-stack*) 16)
+                   ;; Initialize table: word 0 = 0 (character count)
+                   (mem-set-word! table-addr 0)
+                   (set! *stream3-stack* (cons table-addr *stream3-stack*))))))
          ((= stream -3)
           ;; Disable stream 3: pop the table stack
           (when (not (null? *stream3-stack*))
@@ -1177,6 +1275,26 @@
     (lambda (ops)
       ;; Ignore sound effects
       'ok))
+
+  ;; VAR:22 read_char 1 time routine -> (result) [V4+]
+  (vector-set! *op-var* 22
+    (lambda (ops)
+      ;; Single-key input. Without raw-terminal mode we read a whole
+      ;; line and use its first character (a bare Enter = 13), which
+      ;; keeps "press any key" prompts functional. Timed input
+      ;; (time/routine operands) is not supported.
+      (let ((result-var (read-store-target!))
+            (line (read-line *game-input-port*)))
+        (cond
+         ((eof-object? line)
+          (display "\n[End of input]\n")
+          (flush-output-port (current-output-port))
+          (set! *running* #f)
+          (set-variable! result-var 13))
+         ((string=? line "") (set-variable! result-var 13))
+         (else
+          (set-variable! result-var
+                         (char->zscii-output-code (string-ref line 0))))))))
 
   ;; VAR:23 scan_table x table len form -> (result) ?(label) [V4+]
   (vector-set! *op-var* 23
@@ -1473,7 +1591,7 @@
               (loop (+ i 1)))))
         ;; Overwrite locals with arguments
         (let loop ((i 0) (a args))
-          (when (and (< i num-locals) (not (null? a)))
+          (when (and (< i num-locals) (pair? a))
             (vector-set! locals i (car a))
             (loop (+ i 1) (cdr a))))
         ;; Push frame (also saves current arg count)

@@ -207,11 +207,13 @@
     ;; Default colors: white on black
     (mem-set-byte! #x2C 2)     ; default background = black
     (mem-set-byte! #x2D 9)     ; default foreground = white
-    ;; Clear bits in flags 2 for unsupported features
+    ;; Clear bits in Flags 2 for unsupported features. We preserve the
+    ;; game's requests for transcription (bit 0), fixed-pitch font
+    ;; (bit 1) and undo (bit 4), since all three are actually provided.
+    ;; Cleared: bit 3 (pictures/font3), bit 5 (mouse), bit 7 (sound),
+    ;; bit 8 (menus).
     (let ((flags2 (mem-word #x10)))
-      ;; Clear bit 0 (transcript), bit 3 (pictures/font3), bit 4 (undo),
-      ;; bit 5 (mouse), bit 7 (sound), bit 8 (menus).
-      (mem-set-word! #x10 (bitwise-and flags2 (bitwise-not #b110111001)))))
+      (mem-set-word! #x10 (bitwise-and flags2 (bitwise-not #b110101000)))))
   ;; Do not claim full Standard 1.1 compliance.
   (mem-set-byte! #x32 0)
   (mem-set-byte! #x33 0))
@@ -282,8 +284,128 @@
                  (arithmetic-shift b1 8)
                  b0)))
 
-(define *save-magic* '(90 83 65 86))  ; "ZSAV"
-(define *save-format-version* 1)
+;;;
+;;; Quetzal save format ("IFZS" IFF container)
+;;;
+;;; Files are IFF FORM/IFZS containers holding three chunks:
+;;;   IFhd -- release number, serial number, checksum and the resume PC
+;;;           stored as 3 bytes; identifies the owning story file
+;;;   CMem -- dynamic memory XORed against the pristine story image,
+;;;           run-length encoded (zero byte, n encodes n+1 unchanged
+;;;           bytes); a short decode implies trailing unchanged bytes
+;;;   Stks -- call frames oldest first, preceded by a mandatory dummy
+;;;           frame carrying any top-level evaluation stack
+;;; Reference: "Quetzal Z-machine Common Save-File Format Standard" 1.4.
+
+(define (quetzal-chunk id payload)
+  ;; Build a complete IFF chunk: 4-char ID, big-endian length, payload,
+  ;; plus one pad byte when the payload length is odd.
+  (let ((port (open-output-bytevector)))
+    (for-each (lambda (c) (write-u8! port (char->integer c))) (string->list id))
+    (write-u32! port (bytevector-length payload))
+    (write-bytevector payload port 0 (bytevector-length payload))
+    (when (= 1 (modulo (bytevector-length payload) 2)) (write-u8! port 0))
+    (get-output-bytevector port)))
+
+;; One Quetzal stack frame -> bytes.
+;;   ret-pc: resume address in the caller; res-var: result variable
+;;   number or #f when the call discards its result; args: count of
+;;   arguments supplied; locs/nlocs: locals vector and count; stk:
+;;   evaluation stack, most recent first.
+(define (quetzal-frame ret-pc res-var args locs nlocs stk)
+  (let ((port (open-output-bytevector)))
+    ;; Long: three bytes of return PC then flags 000pLLLL, where p is
+    ;; set for result-discarding calls and LLLL is the local count.
+    (write-u32! port (+ (* ret-pc 256)
+                        nlocs
+                        (if res-var 0 16)))
+    (write-u8! port (if res-var res-var 0))
+    ;; Argument-supplied bitmap (zero means no arguments).
+    (write-u8! port (if (= args 0) 0 (- (arithmetic-shift 1 args) 1)))
+    (write-u16! port (length stk))
+    (let loop ((i 0))
+      (when (< i nlocs)
+        (write-u16! port (vector-ref locs i))
+        (loop (+ i 1))))
+    (for-each (lambda (w) (write-u16! port w)) (reverse stk)) ; least recent first
+    (get-output-bytevector port)))
+
+;; Stks chunk body: dummy frame followed by real frames, oldest first.
+;;
+;; Orientation note: our frames snapshot the CALLER of each call (its
+;; locals, eval stack and argument count, plus return PC and result
+;; variable), while a Quetzal frame describes the CALLED routine. A
+;; Quetzal frame therefore takes its return PC and result variable from
+;; our matching frame, but its locals / eval stack / argument count from
+;; the NEXT-NEWER snapshot -- or from live machine state for the
+;; innermost routine. The dummy frame holds main's eval stack at the
+;; moment it made the first call (or the current stack if none).
+(define (quetzal-stks)
+  (let ((port (open-output-bytevector))
+        (frames *call-stack*))                     ; newest first
+    (let loop ((i 0))
+      (when (< i 6) (write-u8! port 0) (loop (+ i 1))))
+    (let ((top-stack (if (null? frames)
+                         *stack*
+                         (vector-ref (car (reverse frames)) 4))))
+      (write-u16! port (length top-stack))
+      (for-each (lambda (w) (write-u16! port w)) (reverse top-stack)))
+    (let walk ((seq (reverse frames)))               ; oldest first
+      (when (pair? seq)
+        (let* ((f (car seq))
+               (body (if (pair? (cdr seq))
+                         (cadr seq)                  ; next-newer snapshot
+                         ;; innermost routine: live state
+                         (vector #f #f *locals* *num-locals*
+                                 *stack* *current-arg-count*)))
+               (payload (quetzal-frame (vector-ref f 0)     ; return PC
+                                       (vector-ref f 1)     ; result var
+                                       (vector-ref body 5)  ; args
+                                       (vector-ref body 2)  ; locals
+                                       (vector-ref body 3)  ; local count
+                                       (vector-ref body 4)))) ; eval stack
+          (write-bytevector payload port 0 (bytevector-length payload))
+          (walk (cdr seq)))))
+    (get-output-bytevector port)))
+
+;; CMem chunk body: dynamic-memory delta against the pristine story
+;; image, run-length encoded. Trailing runs are omitted on purpose --
+;; readers reconstruct them from the original story file (spec 3.4).
+(define (quetzal-cmem)
+  (let ((port (open-output-bytevector)))
+    (let loop ((i 0) (run 0))
+      (if (< i *static-mem-base*)
+          (let ((delta (bitwise-xor (mem-byte i)
+                                    (bytevector-u8-ref *original-dynamic-memory* i))))
+            (if (= delta 0)
+                (loop (+ i 1) (+ run 1))
+                (begin
+                  (let emit ((r run))
+                    (when (> r 0)
+                      (let ((n (min r 256)))
+                        (write-u8! port 0)
+                        (write-u8! port (- n 1))
+                        (emit (- r n)))))
+                  (write-u8! port delta)
+                  (loop (+ i 1) 0))))
+          (get-output-bytevector port)))))
+
+;; IFhd chunk body: release, serial, checksum and resume PC. Per spec
+;; 5.8 the saved PC points at the branch bytes (V1-3) or the store byte
+;; (V4+) of the save instruction -- exactly where our handlers already
+;; park *pc* before saving.
+(define (quetzal-ifhd saved-pc)
+  (let ((port (open-output-bytevector)))
+    (write-u16! port (mem-word #x02))
+    (let loop ((i 0))
+      (when (< i 6)
+        (write-u8! port (mem-byte (+ #x12 i)))
+        (loop (+ i 1))))
+    (write-u16! port (mem-word #x1C))
+    (write-u8! port (bitwise-and (arithmetic-shift saved-pc -16) #xFF))
+    (write-u8! port (bitwise-and (arithmetic-shift saved-pc -8) #xFF))
+    (write-u8! port (bitwise-and saved-pc #xFF))
+    (get-output-bytevector port)))
 
 (define (sanitize-filename raw)
   ;; Per Z-machine spec S 7.6.1.1 and S 7.6.1.3:
@@ -311,7 +433,7 @@
 (define (prompt-save-filename)
   (display "Save filename [save.zsav]: ")
   (flush-output-port (current-output-port))
-  (let ((line (read-line (current-input-port))))
+  (let ((line (read-line *game-input-port*)))
     (if (or (eof-object? line) (string=? line ""))
         "save.zsav"
         (sanitize-filename line))))
@@ -319,7 +441,7 @@
 (define (prompt-restore-filename)
   (display "Restore filename [save.zsav]: ")
   (flush-output-port (current-output-port))
-  (let ((line (read-line (current-input-port))))
+  (let ((line (read-line *game-input-port*)))
     (if (or (eof-object? line) (string=? line ""))
         "save.zsav"
         (sanitize-filename line))))
@@ -348,101 +470,246 @@
 ;;;
 
 (define (save-state-to-port port saved-pc)
-  ;; Serialize game state to a binary port (shared by save and undo).
-  (for-each (lambda (b) (write-u8! port b)) *save-magic*)
-  (write-u8! port *save-format-version*)
-  (write-u8! port *version*)
-  (write-u32! port *static-mem-base*)
-  (write-u32! port saved-pc)
-  (write-bytevector *memory* port 0 *static-mem-base*)
-  (write-u32! port (length *stack*))
-  (for-each (lambda (v) (write-u16! port v)) *stack*)
-  (write-u8! port *num-locals*)
-  (write-u8! port *current-arg-count*)
-  (let loop ((i 0))
-    (when (< i 15)
-      (write-u16! port (vector-ref *locals* i))
-      (loop (+ i 1))))
-  (write-u32! port (length *call-stack*))
-  (for-each
-   (lambda (frame)
-     (write-u32! port (vector-ref frame 0))
-     (write-u16! port (let ((rv (vector-ref frame 1))) (if rv rv #xFFFF)))
-     (write-u8! port (vector-ref frame 3))
-     (write-u8! port (vector-ref frame 5))
-     (let ((locals (vector-ref frame 2)))
-       (let loop ((i 0))
-         (when (< i 15)
-           (write-u16! port (vector-ref locals i))
-           (loop (+ i 1)))))
-     (let ((stk (vector-ref frame 4)))
-       (write-u32! port (length stk))
-       (for-each (lambda (v) (write-u16! port v)) stk)))
-   *call-stack*))
+  ;; Serialize game state to a binary port as a Quetzal IFZS file
+  ;; (shared by save and undo).
+  (let ((out (open-output-bytevector)))
+    (for-each (lambda (c) (write-u8! out (char->integer c))) (string->list "FORM"))
+    (let* ((ifhd (quetzal-chunk "IFhd" (quetzal-ifhd saved-pc)))
+           (cmem (quetzal-chunk "CMem" (quetzal-cmem)))
+           (stks (quetzal-chunk "Stks" (quetzal-stks)))
+           ;; FORM length counts the form type plus all chunk bytes.
+           (form-len (+ 4 (bytevector-length ifhd)
+                           (bytevector-length cmem)
+                           (bytevector-length stks))))
+      (write-u32! out form-len)
+      (for-each (lambda (c) (write-u8! out (char->integer c))) (string->list "IFZS"))
+      (for-each (lambda (bv) (write-bytevector bv out 0 (bytevector-length bv)))
+                (list ifhd cmem stks)))
+    (let ((bytes (get-output-bytevector out)))
+      (write-bytevector bytes port 0 (bytevector-length bytes)))))
+
+;; --- restore-side bytevector parsing helpers ---
+
+(define (slurp-port port)
+  (let loop ((chunks '()))
+    (let ((chunk (read-bytevector 4096 port)))
+      (if (eof-object? chunk)
+          (apply bytevector-append (reverse chunks))
+          (loop (cons chunk chunks))))))
+
+(define (slice-bv bv start len)
+  (let ((out (make-bytevector len)))
+    (bytevector-copy! out 0 bv start (+ start len))
+    out))
+
+(define (bv-u16 bv i)
+  (bitwise-ior (* 256 (bytevector-u8-ref bv i))
+               (bytevector-u8-ref bv (+ i 1))))
+
+(define (bv-u24 bv i)
+  (+ (* 65536 (bytevector-u8-ref bv i))
+     (* 256 (bytevector-u8-ref bv (+ i 1)))
+     (bytevector-u8-ref bv (+ i 2))))
+
+(define (bv-u32 bv i)
+  (+ (* 16777216 (bytevector-u8-ref bv i))
+     (* 65536 (bytevector-u8-ref bv (+ i 1)))
+     (* 256 (bytevector-u8-ref bv (+ i 2)))
+     (bytevector-u8-ref bv (+ i 3))))
+
+(define (ascii-at? bv i s)
+  (let loop ((k 0))
+    (or (= k (string-length s))
+        (and (= (bytevector-u8-ref bv (+ i k))
+                (char->integer (string-ref s k)))
+             (loop (+ k 1))))))
+
+;; Decode a CMem payload against the pristine story image. Returns a
+;; fresh bytevector of exactly *static-mem-base* bytes.
+(define (decode-cmem data)
+  (when (> (bytevector-length data) *static-mem-base*)
+    (error "CMem chunk overruns dynamic memory"))
+  (let ((out (bytevector-copy *original-dynamic-memory*)))
+    (let loop ((i 0) (pos 0))
+      (if (< pos (bytevector-length data))
+          (let ((b (bytevector-u8-ref data pos)))
+            (if (= b 0)
+                (begin
+                  (when (>= (+ pos 1) (bytevector-length data))
+                    (error "CMem chunk ends mid-run"))
+                  (let ((run (+ 1 (bytevector-u8-ref data (+ pos 1)))))
+                    (when (> (+ i run) *static-mem-base*)
+                      (error "CMem chunk overruns dynamic memory"))
+                    ;; Unchanged bytes: `out' already holds the pristine
+                    ;; image there, so just skip over them.
+                    (loop (+ i run) (+ pos 2))))
+                (begin
+                  (when (>= i *static-mem-base*)
+                    (error "CMem chunk overruns dynamic memory"))
+                  (bytevector-u8-set! out i
+                                      (bitwise-xor b
+                                                   (bytevector-u8-ref *original-dynamic-memory* i)))
+                  (loop (+ i 1) (+ pos 1)))))
+          out))))
+
+;; Parse an Stks payload. Returns two values as a cons:
+;;   (q-frames-oldest-first . top-level-stack)
+;; where each q-frame is #(ret-pc res-var args locs nlocs stk).
+(define (parse-stks data)
+  (define (u16at i) (bv-u16 data i))
+  (when (< (bytevector-length data) 8) (error "Stks chunk truncated"))
+  ;; Dummy frame: six zero bytes, then the top-level stack depth.
+  (let check ((i 0))
+    (when (< i 6)
+      (unless (= 0 (bytevector-u8-ref data i)) (error "Bad dummy stack frame"))
+      (check (+ i 1))))
+  (let ((top-depth (u16at 6)))
+    (when (> (+ 8 (* 2 top-depth)) (bytevector-length data))
+      (error "Stks chunk truncated in dummy frame"))
+    (let* ((top-stack
+            (let pull ((i 0) (acc '()))
+              (if (= i top-depth)
+                  (reverse acc)                    ; head = most recent
+                  (pull (+ i 1)
+                        (cons (u16at (+ 8 (* 2 i))) acc)))))
+           (start (+ 8 (* 2 top-depth))))
+      (cons
+       (let loop ((pos start) (qs '()))
+         (if (>= pos (bytevector-length data))
+             (reverse qs)                          ; oldest first
+             (let* ((ret-pc (bv-u24 data pos))
+                    (flags (bytevector-u8-ref data (+ pos 3)))
+                    (nlocs (bitwise-and flags 15))
+                    (res-var (if (= 0 (bitwise-and flags 16))
+                                 (bytevector-u8-ref data (+ pos 4))
+                                 #f))
+                    (args-byte (bytevector-u8-ref data (+ pos 5)))
+                    (nstk (u16at (+ pos 6)))
+                    (base (+ pos 8)))
+               (when (> (+ base (* 2 (+ nlocs nstk)))
+                        (bytevector-length data))
+                 (error "Stks frame truncated"))
+               ;; Args bitmap must be (2^count - 1): bits filled from bit 0.
+               (let argcheck ((x (+ args-byte 1)) (count 0))
+                 (cond ((= x 1)
+                        (let* ((locs (make-vector 15 0)))
+                          (let lp ((j 0))
+                            (when (< j nlocs)
+                              (vector-set! locs j (u16at (+ base (* 2 j))))
+                              (lp (+ j 1))))
+                          (let ((stk
+                                 (let pull ((i 0) (acc '()))
+                                   (if (= i nstk)
+                                       (reverse acc)
+                                       (pull (+ i 1)
+                                             (cons (u16at (+ base (* 2 (+ nlocs i))))
+                                                   acc))))))
+                            (loop (+ base (* 2 (+ nlocs nstk)))
+                                  (cons (vector ret-pc res-var count locs nlocs stk)
+                                        qs)))))
+                       ((odd? x) (error "Unsupported argument mask in save file"))
+                       (else (argcheck (/ x 2) (+ count 1))))))))
+       top-stack))))
 
 (define (restore-state-from-port port)
-  ;; Deserialize game state from a binary port (shared by restore and undo).
-  ;; Returns #t on success, raises error on failure.
-  (for-each
-   (lambda (expected)
-     (let ((got (read-u8! port)))
-       (when (not (= got expected))
-         (error "Not a valid save file"))))
-   *save-magic*)
-  (let ((fmt (read-u8! port)))
-    (when (not (= fmt *save-format-version*))
-      (error "Unsupported save format version" fmt)))
-  (let ((ver (read-u8! port)))
-    (when (not (= ver *version*))
-      (error "Save is for a different Z-machine version" ver)))
-  (let* ((saved-static-base (read-u32! port))
-         (saved-pc (read-u32! port))
-         (preserved-flags2 (flags2-preserved-bits)))
-    (when (not (= saved-static-base *static-mem-base*))
-      (error "Save has different static memory base"))
-    (let ((mem-data (read-bytevector *static-mem-base* port)))
-      (bytevector-copy! *memory* 0 mem-data))
-    (setup-header-flags!)
-    (restore-flags2-preserved-bits! preserved-flags2)
-    (let ((stack-depth (read-u32! port)))
-      (set! *stack*
-            (let loop ((i 0) (acc '()))
-              (if (= i stack-depth)
-                  (reverse acc)
-                  (loop (+ i 1) (cons (read-u16! port) acc))))))
-    (set! *num-locals* (read-u8! port))
-    (set! *current-arg-count* (read-u8! port))
-    (set! *locals* (make-vector 15 0))
-    (let loop ((i 0))
-      (when (< i 15)
-        (vector-set! *locals* i (read-u16! port))
-        (loop (+ i 1))))
-    (let ((num-frames (read-u32! port)))
-      (set! *call-stack*
-            (let loop ((i 0) (acc '()))
-              (if (= i num-frames)
-                  (reverse acc)
-                  (let* ((return-pc (read-u32! port))
-                         (result-var-raw (read-u16! port))
-                         (result-var (if (= result-var-raw #xFFFF) #f result-var-raw))
-                         (num-locals (read-u8! port))
-                         (arg-count (read-u8! port))
-                         (locals (make-vector 15 0))
-                         (_ (let lp ((j 0))
-                              (when (< j 15)
-                                (vector-set! locals j (read-u16! port))
-                                (lp (+ j 1)))))
-                         (stack-depth (read-u32! port))
-                         (stk (let lp ((j 0) (a '()))
-                                (if (= j stack-depth)
-                                    (reverse a)
-                                    (lp (+ j 1) (cons (read-u16! port) a))))))
-                    (loop (+ i 1)
-                          (cons (vector return-pc result-var locals num-locals stk arg-count)
-                                acc)))))))
-    (set! *pc* saved-pc)
-    #t))
+  ;; Deserialize a Quetzal IFZS file from a binary port (shared by
+  ;; restore and undo). Returns #t on success, raises on failure.
+  ;; Everything is parsed into local variables FIRST and only committed
+  ;; to machine state at the very end, so a corrupt/truncated file or a
+  ;; save from a different story leaves the interpreter untouched.
+  (apply-quetzal! (slurp-port port)))
 
+(define (apply-quetzal! data)
+  (define len (bytevector-length data))
+  (when (< len 12) (error "Not a Quetzal save file"))
+  (unless (ascii-at? data 0 "FORM") (error "Not an IFF file"))
+  (unless (ascii-at? data 8 "IFZS") (error "Not a Quetzal save file"))
+  (unless (= (bv-u32 data 4) (- len 8))
+    (error "Quetzal container length mismatch"))
+  (let scan ((pos 12)
+             (ifhd #f) (mem-data #f) (stks-data #f)
+             (seen-mem #f) (seen-stks #f))
+    (if (>= pos len)
+        (finish-quetzal! ifhd mem-data stks-data)
+        (let* ((chunk-len (bv-u32 data (+ pos 4)))
+               (body-start (+ pos 8))
+               (body-end (+ body-start chunk-len))
+               (next (if (= 1 (modulo chunk-len 2)) (+ body-end 1) body-end)))
+          (when (> (+ pos 8) len) (error "Truncated chunk header"))
+          (when (> body-end len) (error "Chunk overruns file"))
+          (cond
+           ((and (= pos 12) (ascii-at? data pos "IFhd"))
+            ;; IFhd must be the first chunk (spec 5.4).
+            (scan next (slice-bv data body-start chunk-len)
+                  mem-data stks-data seen-mem seen-stks))
+           ((ascii-at? data pos "IFhd")
+            ;; Duplicate IFhd: skip it (spec 8.8/8.9).
+            (scan next ifhd mem-data stks-data seen-mem seen-stks))
+           ((and (not seen-mem) (ascii-at? data pos "UMem"))
+            (unless (= chunk-len *static-mem-base*)
+              (error "UMem chunk has wrong size"))
+            (scan next ifhd (slice-bv data body-start chunk-len)
+                  stks-data #t seen-stks))
+           ((and (not seen-mem) (ascii-at? data pos "CMem"))
+            (scan next ifhd (decode-cmem (slice-bv data body-start chunk-len))
+                  stks-data #t seen-stks))
+           ((and (not seen-stks) (ascii-at? data pos "Stks"))
+            (scan next ifhd mem-data
+                  (slice-bv data body-start chunk-len) seen-mem #t))
+           ;; Unknown or duplicate chunk: skip it (spec 8.9).
+           (else
+            (scan next ifhd mem-data stks-data seen-mem seen-stks)))))))
+
+(define (finish-quetzal! ifhd mem-data stks-data)
+  (unless ifhd (error "Save file has no IFhd chunk"))
+  (unless mem-data (error "Save file has no memory chunk"))
+  (unless stks-data (error "Save file has no Stks chunk"))
+  (when (< (bytevector-length ifhd) 13) (error "IFhd chunk too small"))
+  ;; Story identity: release, serial, checksum against this story's header.
+  (unless (and (= (bv-u16 ifhd 0) (mem-word #x02))
+               (let serial-ok? ((k 0))
+                 (or (= k 6)
+                     (and (= (bytevector-u8-ref ifhd (+ 2 k))
+                             (mem-byte (+ #x12 k)))
+                          (serial-ok? (+ k 1)))))
+               (= (bv-u16 ifhd 8) (mem-word #x1C)))
+    (error "Save file was not made from this story"))
+  (let* ((saved-pc (bv-u24 ifhd 10))
+         (parsed (parse-stks stks-data)))
+    (commit-quetzal! saved-pc mem-data (car parsed) (cdr parsed))))
+
+(define (commit-quetzal! saved-pc mem-data qs top-stack)
+  ;; qs: Quetzal frames oldest first. Invert the caller-snapshot mapping:
+  ;; our frame for routine j takes return PC / result var from q_j, and
+  ;; locals / eval stack / argument count from q_{j-1} (dummy context for
+  ;; the oldest -- main's locals are dead data). The newest q is the live
+  ;; routine and becomes current machine state.
+  (define dummy-src (vector 0 0 0 (make-vector 15 0) 0 '()))
+  (let build ((todo qs)                       ; oldest -> newest
+              (prev #f)                       ; previous q (= caller context)
+              (acc '()))                      ; our frames, newest first
+    (if (null? todo)
+        (let* ((live (or prev dummy-src))
+               (preserved (flags2-preserved-bits)))   ; before clobbering memory
+          (bytevector-copy! *memory* 0 mem-data)
+          (setup-header-flags!)
+          (restore-flags2-preserved-bits! preserved)
+          (set! *stack* top-stack)
+          (set! *locals* (vector-ref live 3))
+          (set! *num-locals* (vector-ref live 4))
+          (set! *current-arg-count* (vector-ref live 2))
+          (set! *call-stack* acc)
+          (set! *pc* saved-pc)
+          #t)
+        (let* ((q (car todo))
+               (src (or prev dummy-src))
+               (frame (vector (vector-ref q 0)      ; return PC
+                              (vector-ref q 1)      ; result var
+                              (vector-ref src 3)    ; caller locals
+                              (vector-ref src 4)    ; caller local count
+                              (vector-ref src 5)    ; caller eval stack
+                              (vector-ref src 2)))) ; caller arg count
+          (build (cdr todo) q (cons frame acc))))))
 (define (do-save-undo saved-pc)
   ;; Save game state to in-memory undo buffer. Returns #t on success.
   (guard (exn (#t #f))
@@ -480,17 +747,19 @@
   (set! *current-window* 0)
   (set! *upper-window-height* 0)
   (set! *output-buffer* '())
-  (set! *buffering* #t)
   (set! *stream2-active?* #f)
   (set! *stream2-warning-shown?* #f)
   (set! *stream3-stack* '())
   (set! *input-stream* 0)
+  (set! *current-style* 0)
+  (set! *win1-row* 1)
+  (set! *win1-col* 1)
   (when (not (null? *transcript-port*))
     (guard (exn (#t 'ok)) (close-output-port *transcript-port*))
     (set! *transcript-port* '()))
-  (set! *random-state* 'random)
-  (set! *random-counter* 0)
-  (set! *random-seed* 0)))
+  (set! *rng-a* 1)
+  (set! *rng-interval* 0)
+  (set! *rng-counter* 0)))
 
 ;;;
 ;;; Story file loading
